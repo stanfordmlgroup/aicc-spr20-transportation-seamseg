@@ -39,21 +39,22 @@ from csv_dataset import ISSTestCSVDatatset
 
 def binary_classification(input_csv_path,
                           output_csv_path,
+                          log_dir,
                           lbl_pixel_min=1,
                           transport_infra='marking--crosswalk-zebra',
                           **kwargs):
 
+    model, meta, config, test_kwargs = _init_pretrained_and_logging(log_dir, **kwargs)
     rank, world_size = distributed.get_rank(), distributed.get_world_size()
-    model, meta, config, test_kwargs = _init_pretrained_and_logging(**kwargs)
     test_dataloader = _make_dataloader(input_csv_path, config, rank, world_size)
 
     transport_infra_id = meta['categories'].index(transport_infra)
     def label_function(raw_pred):
-        sem_pred, _,_,_,_,_ = raw_pred
-        lbls, lbl_counts = np.unique(sem_pred, return_counts=True)
-        lbl2count = dict(zip(unique, counts))
+        sem_pred, _,_,_,_ = raw_pred
+        lbls, lbl_counts = np.unique(sem_pred.cpu(), return_counts=True)
+        lbl2count = dict(zip(lbls, lbl_counts))
         transport_infra_npxl = lbl2count.get(transport_infra_id)
-        return int(transport_infra_npxl and transport_infra_npxl > lbl_pixel_min)
+        bin_lbl = 1 if transport_infra_npxl and transport_infra_npxl > lbl_pixel_min else 0
 
     labels = _test(model,
                    test_dataloader,
@@ -62,8 +63,8 @@ def binary_classification(input_csv_path,
     imgs_df = pd.read_csv(input_csv_path, index_col=0)
     imgs_df[f'bin-lbl_{transport_infra}'] = labels
 
-def _init_pretrained_and_logging(local_rank,
-                                 log_dir,
+def _init_pretrained_and_logging(log_dir,
+                                 local_rank,
                                  config_path='../config.ini',
                                  model_path='../seamseg_r50_vistas.tar',
                                  meta_path='../metadata.bin',
@@ -101,7 +102,8 @@ def _init_pretrained_and_logging(local_rank,
         'make_panoptic': panoptic_preprocessing,
         'num_stuff': meta['num_stuff'],
         'log_interval': config["general"].getint("log_interval"),
-        'device': device
+        'device': device,
+        'summary': None
     }
     return model, meta, config, test_kwargs
 
@@ -117,17 +119,17 @@ def _log_info(msg, *args, **kwargs):
 
 
 def _make_config(config):
-    log_debug("Loading configuration from %s", config)
+    _log_debug("Loading configuration from %s", config)
 
     conf = load_config(config, DEFAULT_CONFIGS["panoptic"])
 
-    log_debug("\n%s", config_to_string(conf))
+    _log_debug("\n%s", config_to_string(conf))
     return conf
 
 
 def _make_dataloader(input_csv_path, config, rank, world_size):
     config = config["dataloader"]
-    log_debug("Creating dataloaders for dataset in %s", input_csv_path)
+    _log_debug("Creating dataloaders for dataset in %s", input_csv_path)
 
     # Validation dataloader
     test_tf = ISSTestTransform(config.getint("shortest_size"),
@@ -163,7 +165,7 @@ def _make_model(config, num_thing, num_stuff):
     norm_act_static, norm_act_dynamic = norm_act_from_config(body_config)
 
     # Create backbone
-    log_debug("Creating backbone model %s", body_config["body"])
+    _log_debug("Creating backbone model %s", body_config["body"])
     body_fn = models.__dict__["net_" + body_config["body"]]
     body_params = body_config.getstruct("body_params") if body_config.get("body_params") else {}
     body = body_fn(norm_act=norm_act_static, **body_params)
@@ -249,7 +251,7 @@ def _test(model, dataloader, label_function=lambda x: x, **varargs):
 
     data_time = time.time()
     labels = []
-    for it, batch in enumerate(dataloader):
+    for it, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
         with torch.no_grad():
             # Extract data
             img = batch["img"].cuda(device=varargs["device"], non_blocking=True)
@@ -266,13 +268,6 @@ def _test(model, dataloader, label_function=lambda x: x, **varargs):
 
             for i, (sem_pred, bbx_pred, cls_pred, obj_pred, msk_pred) in enumerate(zip(
                     pred["sem_pred"], pred["bbx_pred"], pred["cls_pred"], pred["obj_pred"], pred["msk_pred"])):
-                img_info = {
-                    "batch_size": batch["img"][i].shape[-2:],
-                    "original_size": batch["size"][i],
-                    "rel_path": batch["rel_path"][i],
-                    "abs_path": batch["abs_path"][i]
-                }
-
                 # Compute panoptic output
                 panoptic_pred = make_panoptic(sem_pred, bbx_pred, cls_pred, obj_pred, msk_pred, num_stuff)
 
@@ -296,4 +291,4 @@ def _test(model, dataloader, label_function=lambda x: x, **varargs):
 
 
 if __name__ == "__main__":
-    main(parser.parse_args())
+    fire.Fire(binary_classification)

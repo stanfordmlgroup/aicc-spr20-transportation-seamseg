@@ -23,16 +23,16 @@ class ISSTestCSVDatatset(data.Dataset):
     def __len__(self):
         return len(self._images)
 
-    def __get_item__(self, item):
+    def __getitem__(self, item):
         # Load image
         img_info = self._images.iloc[item]
-        with Image.open(img_info.save_loc]) as img_raw:
+        with Image.open(img_info.save_loc) as img_raw:
             size = (img_raw.size[1], img_raw.size[0])
             img = self.transform(img_raw.convert(mode="RGB"))
 
         return {
             "img": img,
-            "idx": img_info.id,
+            "idx": item,
             "size": size,
             "abs_path": img_info.save_loc
         }
