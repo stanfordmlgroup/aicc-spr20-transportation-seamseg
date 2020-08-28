@@ -3,12 +3,13 @@ import time
 from pathlib import Path
 from collections import OrderedDict
 from functools import partial
-from os import path, mkdir
 
 import numpy as np
 import torch
 import torch.utils.data as data
 import umsgpack
+import fire
+from tqdm import tqdm
 from PIL import Image
 from skimage.morphology import dilation
 from skimage.segmentation import find_boundaries
@@ -34,34 +35,74 @@ from seamseg.utils.panoptic import PanopticPreprocessing
 from seamseg.utils.parallel import DistributedDataParallel
 from seamseg.utils.snapshot import resume_from_snapshot
 
-parser = argparse.ArgumentParser(description="Panoptic testing script")
-parser.add_argument("--local_rank", type=int)
-parser.add_argument("--log_dir", type=str, default=".", help="Write logs to the given directory")
-parser.add_argument("--meta", type=str, help="Path to metadata file of training dataset")
-parser.add_argument("--score_threshold", type=float, default=0.5, help="Detection confidence threshold")
-parser.add_argument("--iou_threshold", type=float, default=0.5, help="Panoptic disambiguation IoU threshold")
-parser.add_argument("--min_area", type=float, default=4096, help="Minimum pixel area for stuff predictions")
-parser.add_argument("--raw", action="store_true", help="Save raw predictions instead of rendered images")
-parser.add_argument("config", metavar="FILE", type=str, help="Path to configuration file")
-parser.add_argument("model", metavar="FILE", type=str, help="Path to model file")
-parser.add_argument("data", metavar="DIR", type=str, help="Path to dataset")
-parser.add_argument("out_dir", metavar="DIR", type=str, help="Path to output directory")
+def binary_classification(meta_path,
+                          output_path,
+                          lbl_pixel_min=1,
+                          **kwargs):
+
+    rank, world_size = distributed.get_rank(), distributed.get_world_size()
+    model, test_kwargs = _init_pretrained_and_logging(**kwargs)
+    # TODO make dataloader
 
 
-def log_debug(msg, *args, **kwargs):
+def _init_pretrained_and_logging(local_rank,
+                                 log_dir,
+                                 config_path='../config.ini',
+                                 model_path='../seamseg_r50_vistas.tar',
+                                 meta_path='../metadata.bin',
+                                 score_threshold=.5,
+                                 iou_threshold=.5,
+                                 min_area=4096):
+    # Initialize multi-processing
+    distributed.init_process_group(backend='nccl', init_method='env://')
+    device_id, device = local_rank, torch.device(local_rank)
+    rank, world_size = distributed.get_rank(), distributed.get_world_size()
+    torch.cuda.set_device(device_id)
+
+    # Initialize logging
+    if rank == 0:
+        logging.init(log_dir, "test")
+
+    # Load configuration
+    config = _make_config(config_path)
+    meta = _load_meta(meta_path)
+
+    # Create model
+    model = _make_model(config, meta["num_thing"], meta["num_stuff"])
+    # Load snapshot
+    _log_debug("Loading snapshot from %s", model_path)
+    resume_from_snapshot(model, model_path, ["body", "rpn_head", "roi_head", "sem_head"])
+
+    # Init GPU stuff
+    torch.backends.cudnn.benchmark = config["general"].getboolean("cudnn_benchmark")
+    model = DistributedDataParallel(model.cuda(device), device_ids=[device_id], output_device=device_id)
+
+    # Panoptic processing parameters
+    panoptic_preprocessing = PanopticPreprocessing(score_threshold, iou_threshold, min_area)
+
+    test_kwargs = {
+        'make_panoptic': panoptic_preprocessing,
+        'num_stuff': meta['num_stuff'],
+        'log_interval': config["general"].getint("log_interval"),
+        'device': device
+    }
+    return model, test_kwargs
+
+
+def _log_debug(msg, *args, **kwargs):
     if distributed.get_rank() == 0:
         logging.get_logger().debug(msg, *args, **kwargs)
 
 
-def log_info(msg, *args, **kwargs):
+def _log_info(msg, *args, **kwargs):
     if distributed.get_rank() == 0:
         logging.get_logger().info(msg, *args, **kwargs)
 
 
-def make_config(args):
-    log_debug("Loading configuration from %s", args.config)
+def _make_config(config):
+    log_debug("Loading configuration from %s", config)
 
-    conf = load_config(args.config, DEFAULT_CONFIGS["panoptic"])
+    conf = load_config(config, DEFAULT_CONFIGS["panoptic"])
 
     log_debug("\n%s", config_to_string(conf))
     return conf
@@ -86,14 +127,14 @@ def make_dataloader(args, config, rank, world_size):
     return test_dl
 
 
-def load_meta(meta_file):
+def _load_meta(meta_file):
     with open(meta_file, "rb") as fid:
         data = umsgpack.load(fid, encoding="utf-8")
         meta = data["meta"]
     return meta
 
 
-def make_model(config, num_thing, num_stuff):
+def _make_model(config, num_thing, num_stuff):
     body_config = config["body"]
     fpn_config = config["fpn"]
     rpn_config = config["rpn"]
@@ -179,7 +220,7 @@ def make_model(config, num_thing, num_stuff):
     return PanopticNet(body, rpn_head, roi_head, sem_head, rpn_algo, roi_algo, sem_algo, classes)
 
 
-def test(model, dataloader, **varargs):
+def test(model, dataloader, **varargs): # NEXT TODO: add binary labelling here
     model.eval()
     dataloader.batch_sampler.set_epoch(0)
 
