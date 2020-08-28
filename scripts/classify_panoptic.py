@@ -35,15 +35,32 @@ from seamseg.utils.panoptic import PanopticPreprocessing
 from seamseg.utils.parallel import DistributedDataParallel
 from seamseg.utils.snapshot import resume_from_snapshot
 
-def binary_classification(meta_path,
-                          output_path,
+from csv_dataset import ISSTestCSVDatatset
+
+def binary_classification(input_csv_path,
+                          output_csv_path,
                           lbl_pixel_min=1,
+                          transport_infra='marking--crosswalk-zebra',
                           **kwargs):
 
     rank, world_size = distributed.get_rank(), distributed.get_world_size()
-    model, test_kwargs = _init_pretrained_and_logging(**kwargs)
-    # TODO make dataloader
+    model, meta, config, test_kwargs = _init_pretrained_and_logging(**kwargs)
+    test_dataloader = _make_dataloader(input_csv_path, config, rank, world_size)
 
+    transport_infra_id = meta['categories'].index(transport_infra)
+    def label_function(raw_pred):
+        sem_pred, _,_,_,_,_ = raw_pred
+        lbls, lbl_counts = np.unique(sem_pred, return_counts=True)
+        lbl2count = dict(zip(unique, counts))
+        transport_infra_npxl = lbl2count.get(transport_infra_id)
+        return int(transport_infra_npxl and transport_infra_npxl > lbl_pixel_min)
+
+    labels = _test(model,
+                   test_dataloader,
+                   label_function=label_function,
+                   **test_kwargs)
+    imgs_df = pd.read_csv(input_csv_path, index_col=0)
+    imgs_df[f'bin-lbl_{transport_infra}'] = labels
 
 def _init_pretrained_and_logging(local_rank,
                                  log_dir,
@@ -86,7 +103,7 @@ def _init_pretrained_and_logging(local_rank,
         'log_interval': config["general"].getint("log_interval"),
         'device': device
     }
-    return model, test_kwargs
+    return model, meta, config, test_kwargs
 
 
 def _log_debug(msg, *args, **kwargs):
@@ -108,15 +125,15 @@ def _make_config(config):
     return conf
 
 
-def make_dataloader(args, config, rank, world_size):
+def _make_dataloader(input_csv_path, config, rank, world_size):
     config = config["dataloader"]
-    log_debug("Creating dataloaders for dataset in %s", args.data)
+    log_debug("Creating dataloaders for dataset in %s", input_csv_path)
 
     # Validation dataloader
     test_tf = ISSTestTransform(config.getint("shortest_size"),
                                config.getstruct("rgb_mean"),
                                config.getstruct("rgb_std"))
-    test_db = ISSTestDataset(args.data, test_tf)
+    test_db = ISSTestCSVDatatset(input_csv_path, test_tf)
     test_sampler = DistributedARBatchSampler(test_db, config.getint("val_batch_size"), world_size, rank, False)
     test_dl = data.DataLoader(test_db,
                               batch_sampler=test_sampler,
@@ -220,7 +237,7 @@ def _make_model(config, num_thing, num_stuff):
     return PanopticNet(body, rpn_head, roi_head, sem_head, rpn_algo, roi_algo, sem_algo, classes)
 
 
-def test(model, dataloader, **varargs): # NEXT TODO: add binary labelling here
+def _test(model, dataloader, label_function=lambda x: x, **varargs):
     model.eval()
     dataloader.batch_sampler.set_epoch(0)
 
@@ -229,9 +246,9 @@ def test(model, dataloader, **varargs): # NEXT TODO: add binary labelling here
 
     make_panoptic = varargs["make_panoptic"]
     num_stuff = varargs["num_stuff"]
-    save_function = varargs["save_function"]
 
     data_time = time.time()
+    labels = []
     for it, batch in enumerate(dataloader):
         with torch.no_grad():
             # Extract data
@@ -261,7 +278,7 @@ def test(model, dataloader, **varargs): # NEXT TODO: add binary labelling here
 
                 # Save prediction
                 raw_pred = (sem_pred, bbx_pred, cls_pred, obj_pred, msk_pred)
-                save_function(raw_pred, panoptic_pred, img_info)
+                labels.append(label_function(raw_pred))
 
             # Log batch
             if varargs["summary"] is not None and (it + 1) % varargs["log_interval"] == 0:
@@ -275,125 +292,7 @@ def test(model, dataloader, **varargs): # NEXT TODO: add binary labelling here
                 )
 
             data_time = time.time()
-
-
-def ensure_dir(dir_path):
-    try:
-        mkdir(dir_path)
-    except FileExistsError:
-        pass
-
-
-def save_prediction_image(_, panoptic_pred, img_info, out_dir, colors, num_stuff):
-    msk, cat, obj, iscrowd = panoptic_pred
-
-    img = Image.open(img_info["abs_path"])
-
-    # Prepare folders and paths
-    folder, img_name = path.split(img_info["rel_path"])
-    img_name, _ = path.splitext(img_name)
-    out_dir = path.join(out_dir, folder)
-    ensure_dir(out_dir)
-    out_path = path.join(out_dir, img_name + ".jpg")
-
-    # Render semantic
-    sem = cat[msk].numpy()
-    crowd = iscrowd[msk].numpy()
-    sem[crowd == 1] = 255
-
-    sem_img = Image.fromarray(colors[sem])
-    sem_img = sem_img.resize(img_info["original_size"][::-1])
-
-    # Render contours
-    is_background = (sem < num_stuff) | (sem == 255)
-    msk = msk.numpy()
-    msk[is_background] = 0
-
-    contours = find_boundaries(msk, mode="outer", background=0).astype(np.uint8) * 255
-    contours = dilation(contours)
-
-    contours = np.expand_dims(contours, -1).repeat(4, -1)
-    contours_img = Image.fromarray(contours, mode="RGBA")
-    contours_img = contours_img.resize(img_info["original_size"][::-1])
-
-    # Compose final image and save
-    out = Image.blend(img, sem_img, 0.5).convert(mode="RGBA")
-    out = Image.alpha_composite(out, contours_img)
-    out.convert(mode="RGB").save(out_path)
-
-
-def save_prediction_raw(raw_pred, _, img_info, out_dir):
-    # Prepare folders and paths
-    folder, img_name = path.split(img_info["rel_path"])
-    img_name, _ = path.splitext(img_name)
-    out_dir = path.join(out_dir, folder)
-    ensure_dir(out_dir)
-    out_path = path.join(out_dir, img_name + ".pth.tar")
-    Path(out_path).parent.mkdir(exist_ok=True, parents=True)
-
-    out_data = {
-        "sem_pred": raw_pred[0]
-    }
-    #out_data = {
-    #    "sem_pred": raw_pred[0],
-    #    "bbx_pred": raw_pred[1],
-    #    "cls_pred": raw_pred[2],
-    #    "obj_pred": raw_pred[3],
-    #    "msk_pred": raw_pred[4]
-    #}
-    torch.save(out_data, out_path)
-
-
-def main(args):
-    # Initialize multi-processing
-    distributed.init_process_group(backend='nccl', init_method='env://')
-    device_id, device = args.local_rank, torch.device(args.local_rank)
-    rank, world_size = distributed.get_rank(), distributed.get_world_size()
-    torch.cuda.set_device(device_id)
-    #torch.cuda.set_device(0)
-    #rank = 0
-
-    # Initialize logging
-    if rank == 0:
-        logging.init(args.log_dir, "test")
-
-    # Load configuration
-    config = make_config(args)
-
-    # Create dataloader
-    test_dataloader = make_dataloader(args, config, rank, world_size)
-    meta = load_meta(args.meta)
-
-    # Create model
-    model = make_model(config, meta["num_thing"], meta["num_stuff"])
-
-    # Load snapshot
-    log_debug("Loading snapshot from %s", args.model)
-    resume_from_snapshot(model, args.model, ["body", "rpn_head", "roi_head", "sem_head"])
-
-    # Init GPU stuff
-    torch.backends.cudnn.benchmark = config["general"].getboolean("cudnn_benchmark")
-    model = DistributedDataParallel(model.cuda(device), device_ids=[device_id], output_device=device_id)
-
-    # Panoptic processing parameters
-    panoptic_preprocessing = PanopticPreprocessing(args.score_threshold, args.iou_threshold, args.min_area)
-
-    if args.raw:
-        save_function = partial(save_prediction_raw, out_dir=args.out_dir)
-    else:
-        palette = []
-        for i in range(256):
-            if i < len(meta["palette"]):
-                palette.append(meta["palette"][i])
-            else:
-                palette.append((0, 0, 0))
-        palette = np.array(palette, dtype=np.uint8)
-
-        save_function = partial(
-            save_prediction_image, out_dir=args.out_dir, colors=palette, num_stuff=meta["num_stuff"])
-    test(model, test_dataloader, device=device, summary=None,
-         log_interval=config["general"].getint("log_interval"), save_function=save_function,
-         make_panoptic=panoptic_preprocessing, num_stuff=meta["num_stuff"])
+    return labels
 
 
 if __name__ == "__main__":

@@ -102,3 +102,4 @@ venv.bak/
 # other
 .idea/
 *.vim
+**/.*.swp
